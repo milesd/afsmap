@@ -1,0 +1,375 @@
+#!/usr/bin/perl
+#
+# $Id: afsmap,v 1.3 2000/09/13 20:11:34 spcwngdn Exp $
+#
+# walks through AFS space listing mount points and/or ACLs
+# starts at /afs
+# maps only one cell (by default, its localhost's cell)
+# does not follow symlinks
+#
+# prints the root ACL for each volume (i.e., the ACL of the mount point)
+#
+# only prints ACLs of regular dirs when they differ from the parent
+# directory's ACL
+
+#--------------------------------< setup >---------------------------------
+use strict;
+use Getopt::Long qw < &GetOptions >;
+use vars qw< @que %vols $ourcell $debug $do_mounts $do_acls >;
+
+sub  lsmount;
+sub  whichcell;
+sub  lsdirs;
+sub  wscell;
+sub  whichvol;
+sub  listacl;
+sub  die_usage;
+sub  printacl;
+
+
+#-----------------------------< command line >-----------------------------
+Getopt::Long::Configure qw< auto_abbrev ignore_case >;
+
+GetOptions(
+	   "d+"      => \$debug,
+	   "cell=s"  => \$ourcell,
+	   "mounts!" => \$do_mounts,
+	   "acls!"   => \$do_acls,
+	   )
+    or exit 1;
+
+if ($debug >1) {
+    select STDOUT;
+    $| = 1;
+}
+
+unless (defined $do_mounts or $do_acls) {
+    die_usage;
+}
+
+unless (defined $ourcell) {
+    $ourcell = wscell;
+
+    length $ourcell or exit 1;	# warning was printed by &wscell
+}
+
+
+{
+    # do /afs
+    my $fullpath = "/afs/$ourcell";
+    my $vol  = whichvol  $fullpath;  length $vol or exit 1;
+    my $acl  = listacl   $fullpath;  length $acl or exit 1;
+    my $cell = whichcell $fullpath;  defined $cell and length $cell or exit 1;
+
+    if ($cell eq $ourcell) {
+	print "$fullpath\t$vol\n" if ($do_mounts);
+	printacl $fullpath, $acl  if ($do_acls);
+
+	@que = map { [ $vol, $_, "$fullpath/$_", $acl ] } lsdirs $fullpath;
+
+	$vols{$vol}++;
+    }
+    else {
+	# mapping a foreign cell ...
+
+	my $parent = $fullpath;
+
+	# look for mounts of $ourcell in /afs
+	#
+	# This map/grep/map contraption is a variation on the sorting idiom
+	# known as a "Schwartzian Transform", in honor of Randall Schwartz,
+	# who invented it.  It's really cool.  If it's confusing, spend a
+	# little time figuring it out or do a web search for "Schwartzian
+	# Transform".  Or do a "perldoc perlfunc" and search for "Schwartzian".
+	#
+	my @start = 
+	    map  { [ $_->[0], $_->[2] ] }
+	    grep {
+		defined $_->[1] and $_->[1] eq $ourcell
+		    and
+		defined $_->[2] and $_->[2] ne ''
+		}
+	    map  { [ $_, whichcell "$parent/$_", lsmount "$parent/$_" ] }
+	    lsdirs $parent;
+
+      REF:
+	foreach my $ref (@start) {
+	    my $path = $$ref[0];
+	    $fullpath = "$parent/$path";
+	    $vol = $$ref[1];
+	    $acl = listacl $fullpath;  length $acl or next REF;
+
+	    print "$fullpath\t$vol"  if ($do_mounts);
+	    printacl $fullpath, $acl if ($do_acls);
+
+	    push @que,
+	        map { [ $vol, $_, "$fullpath/$_", $acl ] } lsdirs $fullpath;
+
+	    $vols{$vol}++;
+	}
+    }
+}
+
+
+scalar @que
+    or exit 0;
+
+# A word about the queue @que ...
+#
+# This is basically a way to do a recursive walk of a directory structure
+# without actually using recursion.  Our AFS tree goes deep enough that
+# recursion ala File::Find errors out.  So, directories to search are pushed
+# onto the end of @que, and when each directory is examined its
+# subdirectories are pushed onto @que.
+#
+# Each element in the array is a reference to an array with four elements:
+# "parentvol", "path", "fullpath", and "parentacl".  Parentvol is the volume
+# which contains this directory.  Path is the path to this directory relative
+# to parentvol.  Fullpath is a full path to this directory (starting at /),
+# necessary for commands like lsmount.  Parentacl is the acl of the parent
+# directory.  (If this directory is a mount point, this will be ignored.)
+# 
+# Each array represents a directory which may or may not be an AFS mount
+# point.  If a directory is in the queue, it's guaranteed (required)
+# that its parentvol is in the cell we care about.  If it's a mount
+# point, there is no assumption about which cell the volume mounted
+# there belongs to.  For this reason, the setup (above) has to be
+# careful about how it seeds the queue.  We could remove the
+# assumption/requirement, but then we'd have to run &whichcell (in
+# essence a system call to "fs whichcell" - not efficient by any stretch
+# of the imagination) on every single directory rather than just on
+# mount points.  A little extra work up front buys us a lot less work in
+# the iteration.
+
+
+# This sort is a cheap little hack to make the dirs which start with '.'
+# come first in the queue.  That way, if both a read/write and a read-only
+# mount of a cell are there, the read/write comes first in the queue and
+# is preferred.
+#
+@que = sort { $a->[1] cmp $b->[1] } @que;
+
+
+
+#-----------------------------< do the find  >-----------------------------
+DIR:
+    while (@que) {
+	my $ref = shift @que;
+	my ($parentvol, $path, $fullpath, $parentacl) = @$ref;
+
+	# find out if this is a mount point
+	#
+	my $vol = lsmount $fullpath;
+	my $acl;
+
+	if (defined $vol and $vol ne '') {
+	    my $cell;
+
+	    # which cell is the mounted volume in?
+	    #
+	    if ($vol =~ /^([^:]+):([^:]+)/) { $cell = $1; $vol = $2 }
+	    else                            { $cell = whichcell $fullpath }
+
+	    # include the cell name in foreign mounts
+	    #
+	    if ($cell ne $ourcell) {
+		$vol = "$cell:$vol";
+	    }
+
+	    print "$parentvol:$path\t$vol\n" if ($do_mounts);
+
+	    if ($cell eq $ourcell) {
+		$acl = listacl $fullpath;
+		printacl "$vol", $acl if ($do_acls);
+	    }
+
+	    $parentvol = $vol;	# this simplifies pushing the
+	    $path = '';		# subdirs onto the queue
+
+	    # if we've already looked at this volume,
+	    # don't bother stepping inside
+	    #
+	    $vols{$vol}++
+		and do {
+		    ($debug > 0)
+			and warn "'$fullpath' is a mount point for volume " .
+			    "'$vol', which we've already seen.  Pruned.\n";
+		    next DIR;
+		};
+
+	    if (not defined $cell or $cell eq '') {
+		next DIR;	# some error or we're not in AFS ...
+	    }
+	    elsif ($cell ne $ourcell) {
+		($debug > 0)
+		    and warn "'$fullpath' is in cell '$cell'.  Pruned.\n";
+		next DIR;
+	    }
+	}
+	elsif ($do_acls and ($acl = listacl $fullpath) ne $parentacl) {
+	    #
+	    # not a mount point, but the ACL changes here. 
+
+	    printacl "$parentvol:$path", $acl;
+	}
+	
+	# add list of child dirs to @que
+	#
+	
+	$path .= '/' if (length $path);
+
+	unshift @que,
+	    map { [ $parentvol, "$path$_", "$fullpath/$_", $acl ] } lsdirs $fullpath;
+    }
+
+
+sub lsmount {
+    # returns the name of the volume mounted if the dir in question is a mount
+    # point, '' or () (depending on context) if the dir is not a mount point,
+    # and undef on error.
+
+    my $dir = shift;
+    my ($out, $vol);
+
+    $out = `fs lsmount '$dir' 2>&1`;
+    chomp $out;
+
+				# \047 is a single quote.  Putting a raw single-
+                                # quote in there confuses emacs perl-mode.
+
+    if ($out =~ /^'\Q$dir\E' is a mount point for volume '[#%]([^\047]+)'$/)
+    {
+	($vol = $1) =~ s/\.readonly$//;
+	return $vol;
+    }
+    elsif ($out =~ /'\Q$dir\E' is a symbolic link/) {
+	warn "Wierd error: 'fs lsmount $dir' said $out, " .
+	    "but I don't look at symlinks.\n";
+	return undef;
+    }
+    elsif ($out =~ /^'\Q$dir\E' is not a mount point\.$/) {
+	return;
+    }
+    else {
+	warn "Unexpected output from 'fs lsmount $dir': $out\n";
+	return undef;
+    }
+}
+
+
+sub whichcell {
+    my $dir = shift;
+
+    my $out = `fs whichcell '$dir' 2>&1`;
+    chomp $out;
+
+    if ($out =~ /^File \Q$dir\E lives in cell '([^\047]+)'$/) {
+	return $1;
+    }
+    elsif ($out =~ /^fs: Invalid argument; it is possible that (.*?) is not in AFS\.$/) {
+	warn "'$dir' does not seem to be in AFS.  Pruned.\n";
+	return;
+    }
+    else {
+	warn "Unexpected output from 'fs whichcell $dir': '$out'.  " .
+	    "Pruned.\n";
+	return undef;
+    }
+}
+
+
+sub lsdirs {
+    my $dir = shift;
+    local *DIR;
+
+    opendir (DIR, $dir) or do {
+	warn "Could not open directory '$dir': $!\n";
+	return;
+    };
+
+    my @dirs =
+	grep { ! /^\.\.?$/ and -d "$dir/$_" and not -l "$dir/$_" } readdir(DIR);
+
+    closedir(DIR);
+
+    return @dirs;
+}
+
+
+sub wscell {
+    my $out = `fs wscell 2>&1`;
+
+    chomp $out;
+
+    if ($out =~ /^This workstation belongs to cell '([^\047]+)'$/) {
+	return $1;
+    }
+
+    warn "Could not determine local AFS cell.  'fs wscell' said: $out\n";
+    return;
+}
+
+
+sub whichvol {
+    my $path = shift;
+    my $out = `fs examine '$path' 2>&1`;
+
+    if ($out =~ /^Volume status for vid = \d+ named ([\w.]+)$/m) {
+	my $vol = $1;
+
+	$vol =~ s/\.readonly$//;
+
+	return $vol;
+    }
+
+    warn "whichvol: Could not parse output of 'fs examine': $out\n";
+    return;
+}
+
+
+sub listacl {
+    my $path = shift;
+    my $out = `fs listacl '$path' 2>&1`;
+
+    if ($out =~ s/^Access list for .*$//m) {
+	$out =~ s/^\n//;
+	return $out;
+    }
+
+    warn "listacl: Could not parse output of 'fs listacl': $out\n";
+    return;	
+}
+
+
+sub die_usage {
+    die "Usage: $0 [ -d ] [ --cell cellname ] [ --mounts ] [ --acls ]\n";
+}
+
+
+sub printacl {
+    my $path = shift;
+    my $acl = shift;
+
+    print "Access list for $path is\n$acl\n";
+}
+
+
+__END__
+
+possible output from "fs lsmount":
+
+  STDOUT:
+    'foo' is a mount point for '[#%]bar'
+    'foo' is a symbolic link, leading to a mount point for volume '[#%]bar'
+
+  STDERR:
+    'foo' is not a mount point.
+
+possible output from "fs whichcell":
+
+  STDOUT:
+    File foo lives in cell 'bar'
+
+  STDERR:
+    fs: Invalid argument; it is possible that foo is not in AFS.
+
