@@ -2,16 +2,13 @@
 #
 # $Id: afsmap,v 1.3 2000/09/13 20:11:34 spcwngdn Exp $
 #
-# walks through AFS space listing mount points and/or ACLs
-# starts at /afs
-# maps only one cell (by default, its localhost's cell)
-# does not follow symlinks
+# This walks through AFS space, listing mount points and/or ACLs
+# Starting at /afs, it maps only one cell (by default, its 
+# localhost's cell). 
 #
-# prints the root ACL for each volume (i.e., the ACL of the mount point)
-#
-# only prints ACLs of regular dirs when they differ from the parent
-# directory's ACL
-
+# It prints the root ACL for each volume (i.e., the ACL of the mount point),
+# and only prints ACLs of regular dirs when they differ from the parent
+# directory's ACL. It does not follow symlinks.
 #--------------------------------< setup >---------------------------------
 use strict;
 use Getopt::Long qw < &GetOptions >;
